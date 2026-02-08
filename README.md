@@ -1,3 +1,36 @@
+# 🛒 Sembako Affiliate System
+
+Sistem affiliate sederhana dan adil untuk menampilkan produk sembako murah berdasarkan **aktivitas nyata**, bukan spam.
+
+---
+
+## 📌 Gambaran Umum
+
+Project ini adalah **platform affiliate ringan** yang dirancang agar:
+
+- produk murah & berkualitas otomatis naik,
+- affiliate yang aktif mendapat keuntungan,
+- akun spam dan akun mati kehilangan pengaruh secara alami.
+
+Semua berjalan **otomatis**, tanpa kurasi manual.
+
+---
+
+## 👥 Peran dalam Sistem
+
+1. **Affiliate**  
+   Mengunggah produk dan membawa pengunjung.
+
+2. **Pengunjung**  
+   Melihat dan mengklik produk.
+
+3. **Sistem**  
+   Mengatur jatah upload, ranking produk, laporan, dan promosi otomatis.
+
+---
+
+## 🔁 Alur Besar Sistem
+
 
 ---
 
