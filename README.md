@@ -1,50 +1,160 @@
-# Affiliate Sembako Platform
-
-Lightweight affiliate platform for basic-goods products, designed with **traffic-based fairness**, **anti-spam mechanics**, and **soft moderation**.
-
-This project demonstrates backend system design focused on resource control, organic growth, and deterministic ranking — without heavy infrastructure.
 
 ---
 
-## 🚀 Features
+## 1️⃣ Pendaftaran Affiliate
 
-- **Affiliate Upload System**
-  - Product uploads require quota
-  - Prevents spam and low-quality flooding
+### Dari sisi pengguna
+- Cukup mengisi **username**
+- Sistem memberikan **private key**
+- Private key **harus disimpan** (tidak bisa dipulihkan)
 
-- **Traffic-Based Reward**
-  - Unique visitors generate upload quota
-  - Repeated clicks are ignored
+### Aturan
+- 1 device / IP → maksimal **1 pendaftaran per 24 jam**
+- Tidak ada reset password
 
-- **Deterministic Product Ranking**
-  - Based on price, rating, and sales
-  - Optional promotion credit (lightweight boost)
-
-- **Soft Moderation (Report System)**
-  - Weighted reports from affiliates and viewers
-  - Content visibility decreases gradually
-
-- **Cron Auto-Promotion**
-  - Inactive affiliates lose influence over time
-  - No hard delete, no sudden reset
+### Tujuan
+- Mencegah akun palsu
+- Setiap akun punya nilai dan tanggung jawab
 
 ---
 
-## 🧠 Design Principles
+## 2️⃣ Login Affiliate
 
-- **Upload is a cost, not a right**  
-  Affiliates must bring real traffic to earn uploads.
+- Login menggunakan **username + private key**
+- Jika valid → bisa mengunggah produk
 
-- **Organic traffic > click spam**  
-  Only unique daily visitors are counted.
+### Pembatasan
+- **1 device hanya untuk 1 akun**
+- Device yang sudah dipakai akun lain → login ditolak
 
-- **Bad content sinks naturally**  
-  Moderation affects ranking, not instant deletion.
-
-- **Inactive accounts do not block the system**  
-  Resources are slowly recycled via cron jobs.
+**Manfaat:** mencegah peternakan akun.
 
 ---
 
-## 🗂 Project Structure
+## 3️⃣ Upload Produk & Jatah Upload
 
+### Konsep Jatah
+Anggap jatah upload seperti **kupon**:
+
+- 1 upload = 1 kupon
+- Kupon habis → tidak bisa upload
+
+### Alur
+1. Affiliate upload produk
+2. Produk tampil di website
+3. Jatah upload berkurang 1
+
+**Tujuan:** mencegah spam dan upload asal-asalan.
+
+---
+
+## 4️⃣ Pengunjung & Klik Produk
+
+### Dari sisi pengunjung
+- Melihat daftar produk
+- Klik produk → diarahkan ke marketplace
+
+### Dari sisi sistem
+- Setiap pengunjung dikenali sebagai **device unik**
+- 1 device dihitung **1x per hari**
+
+**Hasil:** klik berulang dari orang yang sama tidak dihitung.
+
+---
+
+## 5️⃣ Reward Jatah Upload
+
+Jatah upload bertambah berdasarkan **traffic nyata**.
+
+### Aturan
+- 5 pengunjung unik → +0.1 jatah
+- Maksimal +0.3 per hari
+- Total jatah maksimal 3.0
+
+**Prinsip:**  
+> Traffic nyata → reward nyata
+
+---
+
+## 6️⃣ Ranking Produk
+
+Produk tidak ditampilkan acak.
+
+### Faktor Penilaian
+1. Harga lebih murah (paling berpengaruh)
+2. Rating toko
+3. Jumlah terjual
+4. Bonus kecil dari promotion credit
+
+**Hasil:**
+- Produk terbaik naik otomatis
+- Produk mahal / jelek tenggelam sendiri
+
+---
+
+## 7️⃣ Sistem Laporan (Report)
+
+Produk bisa dilaporkan oleh:
+- Affiliate lain
+- Pengunjung biasa
+
+### Bobot Laporan
+- Affiliate: kuat
+- Pengunjung terpercaya: sedang
+- Pengunjung baru: lemah
+
+### Dampak
+- Laporan sedikit → aman
+- Laporan cukup → status *perlu dicek*
+- Laporan berat → produk disembunyikan
+
+Produk tidak langsung dihapus, tapi **diturunkan bertahap**.
+
+---
+
+## 8️⃣ Autopromo untuk Akun Tidak Aktif
+
+Jika affiliate:
+- Tidak login ≥ 30 hari
+- Masih punya sisa jatah upload
+
+### Yang terjadi
+- Jatah upload dikurangi sedikit demi sedikit
+- Jatah diubah menjadi **promotion credit**
+- Promotion credit memberi **boost ringan** ke ranking
+
+### Tujuan
+- Akun mati tidak menyumbat sistem
+- Resource tetap berputar
+- Tidak ada penimbunan jatah
+
+---
+
+## ✅ Kesimpulan
+
+Sistem ini dirancang agar:
+
+- adil untuk affiliate aktif,
+- tahan terhadap spam,
+- berbasis aktivitas nyata,
+- berjalan otomatis tanpa admin manual.
+
+> Yang aktif berkembang.  
+> Yang ditinggal, pelan-pelan kehilangan pengaruh.
+
+---
+
+## 📦 Cocok Digunakan Untuk
+
+- Website affiliate niche
+- Kurasi produk otomatis
+- Eksperimen ekonomi sistem / game economy ringan
+- Project side-hustle berbasis traffic
+
+---
+
+Jika diperlukan, dokumentasi ini bisa dikembangkan ke:
+- diagram arsitektur,
+- flowchart visual,
+- pitch deck non-teknis,
+- atau whitepaper konsep sistem.
