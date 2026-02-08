@@ -1,0 +1,158 @@
+Siap. Ini **README 1 halaman** yang **siap ditempel ke GitHub / dikumpulin / dipresentasikan**.
+Gayanya **profesional, ringkas, tapi kelihatan “niat & paham desain sistem”**.
+
+Kamu tinggal copy–paste. Kalau mau versi Inggris atau versi “lebih akademik”, bilang aja.
+
+---
+
+# 🛒 Affiliate Sembako Platform
+
+Platform affiliate sederhana untuk menampilkan produk sembako dengan **sistem ranking adil, anti-spam, dan berbasis traffic nyata**.
+Dirancang dengan pendekatan *resource economy* dan *soft moderation* agar kualitas konten terjaga tanpa pengawasan manual berat.
+
+---
+
+## ✨ Fitur Utama
+
+* **Affiliate Upload System**
+
+  * Upload produk menggunakan sistem **kuota**
+  * Mencegah spam dan low-quality posting
+
+* **Traffic-Based Reward**
+
+  * Visitor unik → menghasilkan tambahan kuota
+  * Anti klik berulang & bot sederhana
+
+* **Ranking Transparan**
+
+  * Berdasarkan harga, rating, penjualan
+  * Bisa ditambah *promotion credit* (boost ringan)
+
+* **Soft Moderation (Report System)**
+
+  * Laporan berbobot (affiliate & viewer)
+  * Konten bermasalah turun secara bertahap
+
+* **Cron Auto-Promotion**
+
+  * Akun tidak aktif kehilangan pengaruh perlahan
+  * Resource tetap berputar, tanpa hard delete
+
+---
+
+## 🧠 Konsep Desain
+
+Sistem ini dibangun dengan prinsip:
+
+* **Upload is a cost, not a right**
+  Affiliate harus membawa traffic sebelum bisa upload banyak.
+
+* **Traffic nyata lebih berharga dari klik spam**
+  Hanya visitor unik per hari yang dihitung.
+
+* **Konten buruk tenggelam dengan sendirinya**
+  Tidak langsung dihapus, tapi diturunkan visibilitasnya.
+
+* **Akun mati tidak menyumbat sistem**
+  Kuota dibakar perlahan dan dialihkan ke promosi.
+
+---
+
+## 🗂 Struktur Folder
+
+```
+/api        → Backend logic (login, upload, visit, report, cron)
+/includes   → Helper, database, ranking, quota logic
+/public    → Halaman frontend (index, login, register)
+/assets    → CSS & JavaScript
+```
+
+Arsitektur mengikuti pola **MVC sederhana**.
+
+---
+
+## 🔐 Autentikasi
+
+* Affiliate login menggunakan:
+
+  * Username
+  * Password acak (generated system)
+* Password diperlakukan seperti **API key**
+* *Soft device binding* untuk mencegah multi-akun
+
+---
+
+## 📈 Sistem Kuota
+
+* Upload produk → **-1 kuota**
+* Setiap **5 visitor unik / hari** → **+0.1 kuota**
+* Batas:
+
+  * Max 0.3 kuota / hari
+  * Max total 3.0 kuota
+
+Dirancang agar growth bersifat organik.
+
+---
+
+## 🚨 Report & Moderation
+
+Bobot laporan:
+
+* Affiliate: **1.0**
+* Viewer trusted: **0.8**
+* Viewer baru: **0.3**
+
+Status post:
+
+* ≥ 2 → `disputed`
+* ≥ 3 → `hidden`
+
+Pendekatan **weighted reputation-based moderation**.
+
+---
+
+## ⚙️ Cron Job
+
+`cron_autopromo.php` berjalan berkala untuk:
+
+* Mendeteksi affiliate tidak aktif ≥ 30 hari
+* Membakar kuota kecil (≤ 0.1)
+* Mengubahnya menjadi `promotion_credit`
+
+Konsep ini berfungsi sebagai **resource sink**.
+
+---
+
+## 🗄 Database Highlights
+
+* Foreign key & cascade
+* Composite primary key (visitor tracking)
+* ENUM untuk status
+* DECIMAL untuk kuota (akurasi)
+* Index pada kolom kritikal
+
+Fokus pada **data integrity & scalability**.
+
+---
+
+## 🚀 Tujuan Proyek
+
+Proyek ini dibuat untuk menunjukkan:
+
+* Perancangan sistem backend yang adil & efisien
+* Pencegahan spam tanpa kompleksitas berlebihan
+* Pengelolaan resource & ranking secara deterministik
+
+Cocok sebagai **studi kasus sistem affiliate / marketplace ringan**.
+
+---
+
+Kalau mau, next aku bisa:
+
+* ringkasin lagi jadi **README ultra-singkat (½ halaman)**
+* bikin **diagram arsitektur**
+* atau **README versi English untuk GitHub publik**
+
+Tinggal bilang 👌
