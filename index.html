@@ -1,0 +1,1347 @@
+
+Folder htdocs/htdocs/api
+- cron_autopromo.php
+  <?php
+  /**
+   * CRON AUTOPROMO
+   * - Burn upload_quota affiliate yang tidak aktif ≥ 30 hari
+   * - Maks burn: 0.1 per eksekusi
+   * - Dipindahkan ke promotion_credit
+   * - Aman dari minus & race condition
+   */
+  
+  require __DIR__ . '/../includes/db.php';
+  
+  // Ambil affiliate tidak aktif
+  $sql = "
+      SELECT affiliate_id, upload_quota
+      FROM affiliates
+      WHERE affiliate_status != 'active'
+        AND last_login_at IS NOT NULL
+        AND DATEDIFF(NOW(), last_login_at) >= 30
+        AND upload_quota > 0
+  ";
+  
+  $affiliates = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+  
+  foreach ($affiliates as $a) {
+  
+      // pastikan numeric
+      $currentQuota = (float) $a['upload_quota'];
+  
+      // burn maksimal 0.1
+      $burn = min(0.1, $currentQuota);
+  
+      if ($burn <= 0) {
+          continue;
+      }
+  
+      // UPDATE atomic (anti minus & race)
+      $stmt = $pdo->prepare("
+          UPDATE affiliates
+          SET
+              upload_quota = ROUND(upload_quota - :burn, 1),
+              promotion_credit = promotion_credit + :burn
+          WHERE affiliate_id = :id
+            AND upload_quota >= :burn
+      ");
+  
+      $stmt->execute([
+          ':burn' => $burn,
+          ':id'   => $a['affiliate_id']
+      ]);
+  
+      // jika tidak ada row ter-update, skip log
+      if ($stmt->rowCount() === 0) {
+          continue;
+      }
+  
+      // log promo
+      $pdo->prepare("
+          INSERT INTO promotion_logs (affiliate_id, credit_used)
+          VALUES (?, ?)
+      ")->execute([
+          $a['affiliate_id'],
+          $burn
+      ]);
+  }
+  
+  echo "CRON_AUTOPROMO_OK\n";
+
+- login.php
+  <?php
+  require __DIR__ . '/../includes/db.php';
+  require __DIR__ . '/../includes/device.php';
+  
+  session_start();
+  
+  $username = trim($_POST['username'] ?? '');
+  $password = $_POST['password'] ?? '';
+  
+  if ($username === '' || $password === '') {
+      http_response_code(400);
+      exit('Username & password wajib');
+  }
+  
+  /* ambil device */
+  $device_id = getDeviceId($pdo);
+  
+  /* ambil user */
+  $stmt = $pdo->prepare("
+      SELECT * FROM affiliates
+      WHERE username = ?
+      LIMIT 1
+  ");
+  $stmt->execute([$username]);
+  $user = $stmt->fetch(PDO::FETCH_ASSOC);
+  
+  if (!$user || !password_verify($password, $user['password_hash'])) {
+      http_response_code(401);
+      exit('Login gagal');
+  }
+  
+  /* ===============================
+     🔒 DEVICE LOCK LOGIC
+     =============================== */
+  
+  /*
+  KASUS:
+  1. Akun pernah login di device lain → TOLAK
+  2. Device ini sudah dipakai akun lain → TOLAK
+  */
+  
+  // 1️⃣ akun terikat device lain
+  if (
+      !empty($user['last_device_id']) &&
+      $user['last_device_id'] !== $device_id
+  ) {
+      http_response_code(403);
+      exit('Akun ini sudah terikat dengan device lain');
+  }
+  
+  // 2️⃣ device dipakai akun lain
+  $stmt = $pdo->prepare("
+      SELECT affiliate_id
+      FROM affiliates
+      WHERE last_device_id = ?
+        AND affiliate_id != ?
+      LIMIT 1
+  ");
+  $stmt->execute([$device_id, $user['affiliate_id']]);
+  $conflict = $stmt->fetchColumn();
+  
+  if ($conflict) {
+      http_response_code(403);
+      exit('Device ini sudah digunakan akun lain');
+  }
+  
+  /* ===============================
+     ✅ LOGIN SUKSES
+     =============================== */
+  
+  $_SESSION['affiliate_id'] = $user['affiliate_id'];
+  
+  $stmt = $pdo->prepare("
+      UPDATE affiliates
+      SET
+          last_login_at = NOW(),
+          affiliate_status = 'active',
+          last_device_id = ?
+      WHERE affiliate_id = ?
+  ");
+  $stmt->execute([
+      $device_id,
+      $user['affiliate_id']
+  ]);
+  
+  header("Location: /public/upload.php");
+  exit;
+
+- register.php
+  <?php
+  require __DIR__ . "/../includes/db.php";
+  require __DIR__ . "/../includes/device.php";
+  session_start();
+  
+  $username = trim($_POST['username'] ?? '');
+  if ($username === '') {
+      http_response_code(400);
+      exit('Username wajib');
+  }
+  
+  $device_id = getDeviceId($pdo);
+  $ip = $_SERVER['REMOTE_ADDR'];
+  $now = date('Y-m-d H:i:s');
+  
+  /**
+   * 1️⃣ CEK DEVICE / IP DALAM 24 JAM TERAKHIR
+   */
+  $stmt = $pdo->prepare("
+      SELECT affiliate_id, created_at
+      FROM affiliates
+      WHERE (
+          register_device_id = :device
+          OR register_ip = :ip
+      )
+      AND created_at >= (NOW() - INTERVAL 24 HOUR)
+      LIMIT 1
+  ");
+  $stmt->execute([
+      ':device' => $device_id,
+      ':ip'     => $ip
+  ]);
+  
+  if ($stmt->fetch()) {
+      http_response_code(429);
+      exit('⚠️ Pendaftaran dari device / IP ini hanya boleh 1x dalam 24 jam');
+  }
+  
+  /**
+   * 2️⃣ CEK USERNAME UNIK
+   */
+  $stmt = $pdo->prepare("SELECT 1 FROM affiliates WHERE username = ?");
+  $stmt->execute([$username]);
+  if ($stmt->fetch()) {
+      http_response_code(409);
+      exit('Username sudah digunakan');
+  }
+  
+  /**
+   * 3️⃣ BUAT PASSWORD RANDOM (PRIVATE KEY)
+   */
+  $rawPassword = bin2hex(random_bytes(16));
+  $hash = password_hash($rawPassword, PASSWORD_BCRYPT);
+  
+  /**
+   * 4️⃣ INSERT AFFILIATE BARU
+   */
+  $stmt = $pdo->prepare("
+      INSERT INTO affiliates
+      (
+          username,
+          password_hash,
+          affiliate_status,
+          upload_quota,
+          register_ip,
+          register_device_id,
+          created_at
+      )
+      VALUES
+      (?, ?, 'inactive', 1.0, ?, ?, ?)
+  ");
+  
+  $stmt->execute([
+      $username,
+      $hash,
+      $ip,
+      $device_id,
+      $now
+  ]);
+  
+  $_SESSION['affiliate_id'] = $pdo->lastInsertId();
+  
+  /**
+   * 5️⃣ OUTPUT PASSWORD SEKALI SAJA
+   */
+  echo "<h3>✅ AKUN BERHASIL DIBUAT</h3>";
+  echo "<p><b>USERNAME:</b> " . htmlspecialchars($username) . "</p>";
+  echo "<p><b>PRIVATE KEY (SIMPAN!):</b></p>";
+  echo "<pre style='font-size:16px'>$rawPassword</pre>";
+  echo "<p style='color:red'>⚠️ Password ini TIDAK bisa dipulihkan jika hilang</p>";
+
+- report.php
+  <?php
+  require __DIR__ . '/../includes/db.php';
+  require __DIR__ . '/../includes/device.php';
+  require __DIR__ . '/../includes/auth.php';
+  
+  $data = json_decode(file_get_contents("php://input"), true);
+  $post_id = (int)($data['post_id'] ?? 0);
+  if (!$post_id) exit('Post tidak valid');
+  
+  // CEK POST
+  $post = $pdo->prepare("SELECT * FROM posts WHERE post_id=?");
+  $post->execute([$post_id]);
+  $post = $post->fetch(PDO::FETCH_ASSOC);
+  if (!$post) exit('Post tidak ditemukan');
+  
+  // DETEKSI PELAPOR
+  session_start();
+  if (isset($_SESSION['affiliate_id'])) {
+      // affiliate
+      if ($_SESSION['affiliate_id'] == $post['affiliate_id']) {
+          exit('Tidak boleh report post sendiri');
+      }
+      $reporter_type = 'affiliate';
+      $reporter_id = $_SESSION['affiliate_id'];
+      $weight = 1.0;
+  } else {
+      // viewer
+      $device_id = getDeviceId($pdo);
+      $reporter_type = 'viewer';
+      $reporter_id = $device_id;
+  
+      $stmt = $pdo->prepare("SELECT trusted_device_score FROM devices WHERE device_id=?");
+      $stmt->execute([$device_id]);
+      $tds = (int)$stmt->fetchColumn();
+  
+      $weight = ($tds >= 50) ? 0.8 : 0.3;
+  }
+  
+  // SIMPAN REPORT
+  $stmt = $pdo->prepare("
+    INSERT INTO reports (post_id, reporter_type, reporter_id, report_weight)
+    VALUES (?, ?, ?, ?)
+  ");
+  $stmt->execute([$post_id, $reporter_type, $reporter_id, $weight]);
+  
+  // HITUNG TOTAL BOBOT
+  $stmt = $pdo->prepare("
+    SELECT SUM(report_weight) FROM reports WHERE post_id=?
+  ");
+  $stmt->execute([$post_id]);
+  $total = (float)$stmt->fetchColumn();
+  
+  // UPDATE STATUS
+  $newStatus = 'active';
+  if ($total >= 3) $newStatus = 'hidden';
+  elseif ($total >= 2) $newStatus = 'disputed';
+  
+  $pdo->prepare("
+    UPDATE posts SET status=? WHERE post_id=?
+  ")->execute([$newStatus, $post_id]);
+  
+  echo "Report diterima. Status: $newStatus";
+
+- share.php
+  <?php
+  require __DIR__ . '/../includes/db.php';
+  require __DIR__ . '/../includes/device.php';
+  
+  $ref_device = $_GET['r'] ?? null;
+  $new_device = getDeviceId($pdo);
+  
+  if ($ref_device && $ref_device !== $new_device) {
+      $stmt = $pdo->prepare("
+          INSERT IGNORE INTO referrals (ref_device_id, new_device_id)
+          VALUES (?, ?)
+      ");
+      $stmt->execute([$ref_device, $new_device]);
+  }
+  
+  header("Location: /");
+  exit;
+
+- upload.php
+  <?php
+  require __DIR__ . "/../includes/db.php";
+  require __DIR__ . "/../includes/auth.php";
+  
+  $affiliate = requireLogin($pdo); // return affiliate row
+  
+  if ($affiliate['upload_quota'] < 1) {
+      http_response_code(403);
+      exit('Quota habis');
+  }
+  
+  $data = [
+      'affiliate_id'    => $affiliate['affiliate_id'],
+      'category'        => $_POST['category'] ?? '',
+      'product_name'    => $_POST['product_name'] ?? '',
+      'price_displayed' => (int)($_POST['price_displayed'] ?? 0),
+      'shop_rating'     => (float)($_POST['shop_rating'] ?? 0),
+      'sold_count'      => (int)($_POST['sold_count'] ?? 0),
+      'affiliate_link'  => $_POST['affiliate_link'] ?? '',
+      'screenshot_url'  => $_POST['screenshot_url'] ?? ''
+  ];
+  
+  $stmt = $pdo->prepare("
+      INSERT INTO posts
+      (affiliate_id, category, product_name, price_displayed, shop_rating, sold_count, affiliate_link, screenshot_url)
+      VALUES
+      (:affiliate_id, :category, :product_name, :price_displayed, :shop_rating, :sold_count, :affiliate_link, :screenshot_url)
+  ");
+  $stmt->execute($data);
+  
+  // potong quota
+  $pdo->prepare("
+      UPDATE affiliates
+      SET upload_quota = upload_quota - 1
+      WHERE affiliate_id = ?
+  ")->execute([$affiliate['affiliate_id']]);
+  
+  echo "UPLOAD_OK";
+
+- visit.php
+  <?php
+  require __DIR__ . "/../includes/db.php";
+  require __DIR__ . "/../includes/device.php";
+  
+  $device_id = getDeviceId($pdo);
+  $post_id = (int)($_POST['post_id'] ?? 0);
+  $visit_day = (int)date('Ymd');
+  
+  if ($post_id <= 0) exit;
+  
+  $stmt = $pdo->prepare("
+      INSERT IGNORE INTO post_visits
+      (post_id, device_id, visit_day)
+      VALUES (:post, :device, :day)
+  ");
+  $stmt->execute([
+      ':post' => $post_id,
+      ':device' => $device_id,
+      ':day' => $visit_day
+  ]);
+  
+  require __DIR__ . "/../includes/quota.php";
+  updateAffiliateQuota($pdo, $post_id);
+
+
+Folder htdocs/htdocs/includes
+- auth.php
+  <?php
+  function requireLogin(PDO $pdo) {
+      session_start();
+      if (!isset($_SESSION['affiliate_id'])) {
+          http_response_code(401);
+          exit('Harus login');
+      }
+  
+      $stmt = $pdo->prepare("
+        SELECT * FROM affiliates WHERE affiliate_id = ?
+      ");
+      $stmt->execute([$_SESSION['affiliate_id']]);
+      return $stmt->fetch(PDO::FETCH_ASSOC);
+  }
+
+- db.php
+  <?php
+  $DB_HOST = "sql313.infinityfree.com";
+  $DB_NAME = "if0_41100255_sembako";
+  $DB_USER = "if0_41100255";
+  $DB_PASS = "Z43ZwTd65m6Dt48"; // jangan dishare lagi
+  
+  try {
+      $pdo = new PDO(
+          "mysql:host=$DB_HOST;dbname=$DB_NAME;charset=utf8mb4",
+          $DB_USER,
+          $DB_PASS,
+          [
+              PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+              PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+              PDO::ATTR_EMULATE_PREPARES => false
+          ]
+      );
+  } catch (PDOException $e) {
+      http_response_code(500);
+      exit("DB connection failed");
+  }
+
+- device.php
+  <?php
+  function getDeviceId(PDO $pdo) {
+      if (!isset($_COOKIE['device_id'])) {
+          $device_id = uuidv4();
+          setcookie('device_id', $device_id, time() + (86400 * 365), "/");
+  
+          $stmt = $pdo->prepare("
+              INSERT INTO devices (device_id)
+              VALUES (:id)
+          ");
+          $stmt->execute([':id' => $device_id]);
+      } else {
+          $device_id = $_COOKIE['device_id'];
+  
+          $stmt = $pdo->prepare("
+              UPDATE devices SET last_seen_at = NOW()
+              WHERE device_id = :id
+          ");
+          $stmt->execute([':id' => $device_id]);
+      }
+  
+      return $device_id;
+  }
+  
+  function uuidv4() {
+      return sprintf(
+          '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+          mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+          mt_rand(0, 0xffff),
+          mt_rand(0, 0x0fff) | 0x4000,
+          mt_rand(0, 0x3fff) | 0x8000,
+          mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+      );
+  }
+
+- quota.php
+  <?php
+  function updateAffiliateQuota(PDO $pdo, $post_id) {
+  
+      // Ambil affiliate pemilik post
+      $stmt = $pdo->prepare("
+          SELECT affiliate_id FROM posts WHERE post_id = :post
+      ");
+      $stmt->execute([':post' => $post_id]);
+      $affiliate_id = $stmt->fetchColumn();
+  
+      if (!$affiliate_id) return;
+  
+      // Hit visitor unik hari ini
+      $today = date('Ymd');
+  
+      $stmt = $pdo->prepare("
+          SELECT COUNT(*) FROM post_visits
+          WHERE post_id = :post AND visit_day = :day
+      ");
+      $stmt->execute([
+          ':post' => $post_id,
+          ':day'  => $today
+      ]);
+  
+      $visitor_count = (int)$stmt->fetchColumn();
+  
+      // Hit quota gain
+      $quota_gain = floor($visitor_count / 5) * 0.1;
+  
+      if ($quota_gain <= 0) return;
+  
+      // Batasi max 0.3 / hari
+      $quota_gain = min($quota_gain, 0.3);
+  
+      // Update quota
+      $stmt = $pdo->prepare("
+          UPDATE affiliates
+          SET upload_quota = upload_quota + :gain
+          WHERE affiliate_id = :aid
+            AND upload_quota < 3.0
+      ");
+      $stmt->execute([
+          ':gain' => $quota_gain,
+          ':aid'  => $affiliate_id
+      ]);
+  }
+
+- ranking.php
+  <?php
+  function getRankedProducts(PDO $pdo, $limit = 20) {
+  
+    // min price & max sold
+    $minPrice = $pdo->query("
+      SELECT MIN(price_displayed)
+      FROM posts WHERE status!='hidden'
+    ")->fetchColumn();
+  
+    $maxSold = $pdo->query("
+      SELECT MAX(sold_count)
+      FROM posts WHERE status!='hidden'
+    ")->fetchColumn();
+  
+    $sql = "
+      SELECT p.*, a.promotion_credit
+      FROM posts p
+      JOIN affiliates a ON p.affiliate_id = a.affiliate_id
+      WHERE p.status != 'hidden'
+    ";
+  
+    $posts = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+  
+    foreach ($posts as &$p) {
+  
+      $price_score  = $minPrice / max($p['price_displayed'],1);
+      $rating_score = $p['shop_rating'] / 5;
+      $sold_score   = log($p['sold_count'] + 1) / log($maxSold + 1);
+  
+      $base =
+        ($price_score * 0.55) +
+        ($rating_score * 0.25) +
+        ($sold_score * 0.20);
+  
+      $promo = min($p['promotion_credit'] * 0.05, 0.15);
+  
+      $status_mul = match($p['status']) {
+        'disputed' => 0.7,
+        default    => 1.0
+      };
+  
+      $p['final_score'] = ($base * $status_mul) + $promo;
+    }
+  
+    usort($posts, fn($a,$b) => $b['final_score'] <=> $a['final_score']);
+  
+    return array_slice($posts, 0, $limit);
+  }
+
+
+Folder htdocs/htdocs
+- note.txt
+  Oke, ini aku jelaskan **pakai bahasa santai tapi tetap “kena” ke orang teknis**. Anggap ini sedang diceritakan ke **dua audiens sekaligus**:
+  
+  * orang awam (biar paham alur besarnya),
+  * dan engineer web (biar tahu kenapa desainnya masuk akal).
+  
+  ---
+  
+  ## Gambaran besar dulu (biar nggak nyemplung langsung ke kode)
+  
+  Ini adalah **sistem affiliate sederhana tapi rapi** untuk menampilkan produk sembako murah.
+  Ada 4 aktor utama:
+  
+  1. **Affiliate** → orang yang upload produk (pakai kuota)
+  2. **Pengunjung** → orang biasa yang lihat & klik produk
+  3. **Sistem** → yang ngatur ranking, kuota, laporan, dan promosi
+  4. **Cron job** → “petugas kebersihan” otomatis yang jalan berkala
+  
+  Alur singkatnya:
+  
+  > Affiliate upload produk → pengunjung klik & lihat → sistem ngasih reward kuota → ranking diatur → kalau ada masalah, bisa direport → yang nganggur kelamaan, kuotanya “dibakar” pelan-pelan
+  
+  ---
+  
+  ## Struktur folder (kenapa dipisah-pisah)
+  
+  ```
+  api/        → backend logic (mesin)
+  includes/   → helper & utilitas (otak kecil)
+  public/     → tampilan (etalase)
+  assets/     → JS & CSS (hiasan)
+  ```
+  
+  Ini pola **MVC mini versi realistis**:
+  
+  * `public` = View
+  * `api` = Controller
+  * `includes` = Model + helper
+  
+  ---
+  
+  ## 1️⃣ Login & Register Affiliate
+  
+  ### register.php (API)
+  
+  * User daftar **hanya pakai username**
+  * Sistem otomatis:
+  
+    * bikin **password random (private key)**
+    * di-hash (bcrypt)
+    * **tidak bisa direcover** (security by design)
+  
+  📌 Filosofi:
+  
+  > Sistem ini memperlakukan password seperti **API key**, bukan password manusia.
+  
+  Cocok untuk affiliate / bot / automation.
+  
+  ---
+  
+  ### login.php (API)
+  
+  * Cocokkan username + password hash
+  * Kalau benar:
+  
+    * simpan `affiliate_id` di session
+    * update:
+  
+      * `last_login_at`
+      * status jadi `active`
+  
+  📌 Ini penting karena:
+  
+  * login = tanda “masih hidup”
+  * cron nanti pakai info ini buat “menghukum” akun yang mati
+  
+  ---
+  
+  ## 2️⃣ Upload Produk + Sistem Kuota
+  
+  ### upload.php (API)
+  
+  Sebelum upload:
+  
+  * dicek dulu: **upload_quota ≥ 1**
+  * kalau habis → ditolak
+  
+  Setelah upload:
+  
+  * produk masuk ke tabel `posts`
+  * **kuota dipotong 1**
+  
+  📌 Kuota = “bensin”
+  Affiliate nggak bisa spam upload tanpa traffic.
+  
+  ---
+  
+  ### visit.php + quota.php
+  
+  Setiap kali card produk diklik:
+  
+  * sistem catat **visitor unik per hari**
+  * dihitung:
+  
+    ```
+    tiap 5 visitor unik → +0.1 kuota
+    max 0.3 per hari
+    max total quota 3.0
+    ```
+  
+  📌 Artinya:
+  
+  * traffic nyata → reward nyata
+  * klik berulang dari device sama → nggak dihitung
+  
+  Ini **anti bot & anti fake traffic ringan**.
+  
+  ---
+  
+  ## 3️⃣ Device Tracking (tanpa login)
+  
+  ### device.php
+  
+  Kalau pengunjung belum punya cookie:
+  
+  * dibuat `device_id` (UUID)
+  * disimpan di cookie + database
+  
+  Kalau sudah ada:
+  
+  * update `last_seen_at`
+  
+  📌 Keuntungannya:
+  
+  * bisa hitung visitor unik
+  * bisa dipakai buat:
+  
+    * report
+    * referral
+    * trust score
+  
+  Tanpa login, tanpa ribet.
+  
+  ---
+  
+  ## 4️⃣ Sistem Report (cerdas tapi nggak ribet)
+  
+  ### report.php
+  
+  Siapa saja bisa report:
+  
+  * **affiliate lain**
+  * **viewer biasa**
+  
+  Bobot report:
+  
+  * affiliate → **1.0**
+  * viewer:
+  
+    * device trusted → **0.8**
+    * device baru → **0.3**
+  
+  Total bobot menentukan status post:
+  
+  * ≥ 2 → `disputed`
+  * ≥ 3 → `hidden`
+  
+  📌 Ini **soft moderation system**:
+  
+  * nggak langsung hapus
+  * makin banyak laporan valid → makin tenggelam
+  
+  ---
+  
+  ## 5️⃣ Ranking Produk (ini bagian “otak”)
+  
+  ### ranking.php
+  
+  Setiap produk dihitung skornya:
+  
+  Faktor utama:
+  
+  * **Harga murah** (paling berat)
+  * **Rating toko**
+  * **Jumlah terjual**
+  
+  Bonus:
+  
+  * `promotion_credit` (iklan alami)
+  * Penalti kalau status `disputed`
+  
+  Formula ini:
+  
+  * fair
+  * transparan
+  * bisa di-tuning
+  
+  📌 Promotion credit = “boost ringan”, bukan pay-to-win.
+  
+  ---
+  
+  ## 6️⃣ Promotion Credit & Cron Autopromo
+  
+  ### cron_autopromo.php
+  
+  Ini script yang jalan otomatis (misalnya 1x sehari).
+  
+  Yang dia lakukan:
+  
+  * cari affiliate:
+  
+    * tidak aktif ≥ 30 hari
+    * masih punya upload_quota
+  * **bakar kuota sedikit demi sedikit (max 0.1)**
+  * hasil burn dipindah ke `promotion_credit`
+  
+  Kenapa ini cerdas:
+  
+  * akun mati → nggak nyumbat sistem
+  * resource tetap muter
+  * **tidak bisa minus**
+  * **aman dari race condition**
+  
+  Ini desain ala **game economy / resource sink**.
+  
+  ---
+  
+  ## 7️⃣ Frontend (sederhana tapi efektif)
+  
+  * `index.php`:
+  
+    * ambil produk ranking teratas
+    * tampilkan card
+  
+  * `main.js`:
+  
+    * klik card → hit visit API (diam-diam)
+  
+  * `style.css`:
+  
+    * mobile-first
+    * grid responsive
+    * status disputed kelihatan samar
+  
+  📌 Frontend ini sengaja:
+  
+  * minim JS
+  * SEO friendly
+  * cepat
+  
+  ---
+  
+  ## 8️⃣ Database Design (ringkas tapi niat)
+  
+  Ciri-ciri bagus:
+  
+  * foreign key jelas
+  * index di kolom penting
+  * `DECIMAL` untuk kuota (bukan float ngawur)
+  * `ENUM` untuk status → aman dari typo
+  
+  Ini skema **production-minded**, bukan tutorial asal jadi.
+  
+  ---
+  
+  ## Penutup (kesimpulan jujur)
+  
+  Kalau dijelaskan ke orang awam:
+  
+  > Ini sistem yang adil: siapa yang bawa traffic, dapat kuota.
+  > Yang curang atau ditinggal, pelan-pelan diturunin pengaruhnya.
+  
+
+
+Folder htdocs/htdocs/public/assets
+- main.js
+  document.querySelectorAll('.card').forEach(card => {
+    card.addEventListener('click', () => {
+      fetch('/api/visit.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'post_id=' + card.dataset.post
+      });
+    });
+  });
+
+- style.css
+  /* RESET SEDERHANA */
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  
+  body {
+    background: #f6f7f9;
+    color: #222;
+    padding: 12px;
+  }
+  
+  /* HEADER */
+  h1 {
+    font-size: 1.2rem;
+    margin-bottom: 12px;
+    text-align: center;
+  }
+  
+  /* GRID PRODUK */
+  .products {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  
+  /* CARD */
+  .card {
+    background: #fff;
+    border-radius: 10px;
+    padding: 10px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+  }
+  
+  /* GAMBAR */
+  .card img {
+    width: 100%;
+    border-radius: 8px;
+    margin-bottom: 8px;
+  }
+  
+  /* NAMA PRODUK */
+  .card h3 {
+    font-size: 0.95rem;
+    margin-bottom: 6px;
+  }
+  
+  /* HARGA */
+  .price {
+    font-size: 1.05rem;
+    font-weight: bold;
+    color: #d32f2f;
+    margin-bottom: 4px;
+  }
+  
+  /* META */
+  .meta {
+    font-size: 0.8rem;
+    color: #555;
+    margin-bottom: 8px;
+  }
+  
+  /* BUTTON */
+  .card a {
+    display: block;
+    text-align: center;
+    background: #ff5722;
+    color: white;
+    padding: 8px;
+    border-radius: 6px;
+    text-decoration: none;
+    font-weight: 600;
+  }
+  
+  .card a:hover {
+    opacity: 0.9;
+  }
+  
+  /* DISPUTED */
+  .card.disputed {
+    opacity: 0.75;
+    border: 1px solid #ffc107;
+  }
+  
+  .card.disputed::before {
+    content: "Perlu dicek";
+    display: inline-block;
+    background: #ffc107;
+    color: #000;
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-bottom: 6px;
+  }
+  
+  /* DESKTOP */
+  @media (min-width: 768px) {
+    .products {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  
+    body {
+      max-width: 1100px;
+      margin: auto;
+    }
+  }
+
+
+Folder htdocs/htdocs/public
+- index.php
+  <?php
+  require __DIR__ . "/../includes/db.php";
+  require __DIR__ . "/../includes/device.php";
+  require __DIR__ . "/../includes/ranking.php";
+  
+  $device_id = getDeviceId($pdo);
+  $products = getRankedProducts($pdo, 20);
+  ?>
+  <!DOCTYPE html>
+  <html>
+  <head>
+      <meta charset="UTF-8">
+      <title>Sembako Murah Shopee</title>
+      <link rel="stylesheet" href="assets/style.css">
+  </head>
+  <body>
+  
+  <h1>Sembako Murah Hari Ini</h1>
+  
+  <?php foreach ($products as $p): ?>
+  <div class="card" data-post="<?= $p['post_id'] ?>">
+      <img src="<?= htmlspecialchars($p['screenshot_url']) ?>" alt="">
+      <h3><?= htmlspecialchars($p['product_name']) ?></h3>
+      <p>Harga: <b>Rp<?= number_format($p['price_displayed']) ?></b></p>
+      <p>Rating: <?= $p['shop_rating'] ?> ⭐ | Terjual: <?= $p['sold_count'] ?></p>
+      <a href="<?= htmlspecialchars($p['affiliate_link']) ?>" target="_blank">
+          Beli di Shopee
+      </a>
+  </div>
+  <?php endforeach; ?>
+  
+  <script src="assets/main.js"></script>
+  </body>
+  </html>
+
+- login.php
+  <form method="post" action="/api/login.php">
+    <h2>Login Affiliate</h2>
+    <input name="username" placeholder="Username" required>
+    <input name="password" placeholder="Private Key" required>
+    <button>Login</button>
+  </form>
+
+- post.php
+  <button onclick="reportPost(<?= $post['post_id'] ?>)">
+    Laporkan
+  </button>
+  
+  <script>
+  function reportPost(postId) {
+    fetch('/api/report.php', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ post_id: postId })
+    })
+    .then(r => r.text())
+    .then(alert);
+  }
+  </script>
+
+- register.php
+  <form method="post" action="/api/register.php">
+    <h2>Daftar Affiliate</h2>
+    <input name="username" placeholder="Username" required>
+    <button>Daftar</button>
+  </form>
+
+- share.php
+  <?php
+  $ref = $_GET['r'] ?? '';
+  header("Location: /api/share.php?r=$ref");
+  exit;
+
+- upload.php
+  <?php
+  require __DIR__ . '/../includes/db.php';
+  require __DIR__ . '/../includes/auth.php';
+  
+  $affiliate = requireLogin($pdo);
+  ?>
+  <!DOCTYPE html>
+  <html lang="id">
+  <head>
+    <meta charset="UTF-8">
+    <title>Upload Produk</title>
+    <link rel="stylesheet" href="assets/style.css">
+  </head>
+  <body>
+  
+  <h2>Upload Produk Shopee</h2>
+  
+  <form action="/api/upload.php" method="post">
+    <input name="product_name" placeholder="Nama produk" required>
+    <input name="category" placeholder="Kategori" required>
+    <input name="price_displayed" type="number" placeholder="Harga" required>
+    <input name="shop_rating" step="0.1" placeholder="Rating toko" required>
+    <input name="sold_count" type="number" placeholder="Terjual" required>
+    <input name="affiliate_link" placeholder="Link affiliate" required>
+    <input name="screenshot_url" placeholder="URL Screenshot" required>
+    <button type="submit">Upload</button>
+  </form>
+  
+  <p>Quota upload tersisa: <b><?= $affiliate['upload_quota'] ?></b></p>
+  
+  </body>
+  </html>
+
+
+Folder htdocs/htdocs
+- sembako.sql
+  -- phpMyAdmin SQL Dump
+  -- version 4.9.0.1
+  -- https://www.phpmyadmin.net/
+  --
+  -- Host: sql313.infinityfree.com
+  -- Waktu pembuatan: 07 Feb 2026 pada 15.43
+  -- Versi server: 11.4.9-MariaDB
+  -- Versi PHP: 7.2.22
+  
+  SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
+  SET AUTOCOMMIT = 0;
+  START TRANSACTION;
+  SET time_zone = "+00:00";
+  
+  
+  /*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+  /*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+  /*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+  /*!40101 SET NAMES utf8mb4 */;
+  
+  --
+  -- Database: `if0_41100255_sembako`
+  --
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `affiliates`
+  --
+  
+  CREATE TABLE `affiliates` (
+    `affiliate_id` int(11) NOT NULL,
+    `username` varchar(50) NOT NULL,
+    `password_hash` varchar(255) NOT NULL,
+    `upload_quota` decimal(3,1) DEFAULT 1.0,
+    `promotion_credit` decimal(5,2) DEFAULT 0.00,
+    `affiliate_status` enum('inactive','active') DEFAULT 'inactive',
+    `last_login_at` datetime DEFAULT NULL,
+    `created_at` datetime DEFAULT current_timestamp(),
+    `last_device_id` char(36) DEFAULT NULL,
+    `register_ip` varchar(45) DEFAULT NULL,
+    `register_device_id` char(36) DEFAULT NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `devices`
+  --
+  
+  CREATE TABLE `devices` (
+    `device_id` char(36) NOT NULL,
+    `trusted_device_score` int(11) DEFAULT 0,
+    `last_seen_at` datetime DEFAULT current_timestamp()
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `posts`
+  --
+  
+  CREATE TABLE `posts` (
+    `post_id` int(11) NOT NULL,
+    `affiliate_id` int(11) NOT NULL,
+    `category` varchar(50) DEFAULT NULL,
+    `product_name` varchar(255) NOT NULL,
+    `price_displayed` int(11) NOT NULL,
+    `shop_rating` float DEFAULT 0,
+    `sold_count` int(11) DEFAULT 0,
+    `affiliate_link` text NOT NULL,
+    `screenshot_url` text NOT NULL,
+    `status` enum('active','disputed','hidden') DEFAULT 'active',
+    `created_at` datetime DEFAULT current_timestamp()
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `post_visits`
+  --
+  
+  CREATE TABLE `post_visits` (
+    `post_id` int(11) NOT NULL,
+    `device_id` char(36) NOT NULL,
+    `visit_day` int(11) NOT NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `promotion_logs`
+  --
+  
+  CREATE TABLE `promotion_logs` (
+    `log_id` int(11) NOT NULL,
+    `affiliate_id` int(11) NOT NULL,
+    `credit_used` decimal(4,2) NOT NULL,
+    `created_at` datetime DEFAULT current_timestamp()
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `referrals`
+  --
+  
+  CREATE TABLE `referrals` (
+    `ref_device_id` char(36) NOT NULL,
+    `new_device_id` char(36) NOT NULL,
+    `created_at` datetime DEFAULT current_timestamp()
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `register_logs`
+  --
+  
+  CREATE TABLE `register_logs` (
+    `device_id` char(36) NOT NULL,
+    `ip_address` varchar(45) NOT NULL,
+    `created_at` datetime DEFAULT current_timestamp()
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  -- --------------------------------------------------------
+  
+  --
+  -- Struktur dari tabel `reports`
+  --
+  
+  CREATE TABLE `reports` (
+    `report_id` int(11) NOT NULL,
+    `post_id` int(11) NOT NULL,
+    `reporter_type` enum('affiliate','viewer') NOT NULL,
+    `reporter_id` varchar(50) NOT NULL,
+    `report_weight` float NOT NULL,
+    `created_at` datetime DEFAULT current_timestamp()
+  ) ENGINE=InnoDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci;
+  
+  --
+  -- Indexes for dumped tables
+  --
+  
+  --
+  -- Indeks untuk tabel `affiliates`
+  --
+  ALTER TABLE `affiliates`
+    ADD PRIMARY KEY (`affiliate_id`),
+    ADD UNIQUE KEY `username` (`username`),
+    ADD KEY `last_device_id` (`last_device_id`);
+  
+  --
+  -- Indeks untuk tabel `devices`
+  --
+  ALTER TABLE `devices`
+    ADD PRIMARY KEY (`device_id`);
+  
+  --
+  -- Indeks untuk tabel `posts`
+  --
+  ALTER TABLE `posts`
+    ADD PRIMARY KEY (`post_id`),
+    ADD KEY `affiliate_id` (`affiliate_id`),
+    ADD KEY `status` (`status`);
+  
+  --
+  -- Indeks untuk tabel `post_visits`
+  --
+  ALTER TABLE `post_visits`
+    ADD PRIMARY KEY (`post_id`,`device_id`,`visit_day`);
+  
+  --
+  -- Indeks untuk tabel `promotion_logs`
+  --
+  ALTER TABLE `promotion_logs`
+    ADD PRIMARY KEY (`log_id`),
+    ADD KEY `fk_promo_affiliate` (`affiliate_id`);
+  
+  --
+  -- Indeks untuk tabel `referrals`
+  --
+  ALTER TABLE `referrals`
+    ADD PRIMARY KEY (`ref_device_id`,`new_device_id`);
+  
+  --
+  -- Indeks untuk tabel `register_logs`
+  --
+  ALTER TABLE `register_logs`
+    ADD PRIMARY KEY (`device_id`,`ip_address`),
+    ADD KEY `idx_device` (`device_id`),
+    ADD KEY `idx_ip` (`ip_address`);
+  
+  --
+  -- Indeks untuk tabel `reports`
+  --
+  ALTER TABLE `reports`
+    ADD PRIMARY KEY (`report_id`),
+    ADD KEY `post_id` (`post_id`);
+  
+  --
+  -- AUTO_INCREMENT untuk tabel yang dibuang
+  --
+  
+  --
+  -- AUTO_INCREMENT untuk tabel `affiliates`
+  --
+  ALTER TABLE `affiliates`
+    MODIFY `affiliate_id` int(11) NOT NULL AUTO_INCREMENT;
+  
+  --
+  -- AUTO_INCREMENT untuk tabel `posts`
+  --
+  ALTER TABLE `posts`
+    MODIFY `post_id` int(11) NOT NULL AUTO_INCREMENT;
+  
+  --
+  -- AUTO_INCREMENT untuk tabel `promotion_logs`
+  --
+  ALTER TABLE `promotion_logs`
+    MODIFY `log_id` int(11) NOT NULL AUTO_INCREMENT;
+  
+  --
+  -- AUTO_INCREMENT untuk tabel `reports`
+  --
+  ALTER TABLE `reports`
+    MODIFY `report_id` int(11) NOT NULL AUTO_INCREMENT;
+  
+  --
+  -- Ketidakleluasaan untuk tabel pelimpahan (Dumped Tables)
+  --
+  
+  --
+  -- Ketidakleluasaan untuk tabel `posts`
+  --
+  ALTER TABLE `posts`
+    ADD CONSTRAINT `fk_posts_affiliate` FOREIGN KEY (`affiliate_id`) REFERENCES `affiliates` (`affiliate_id`) ON DELETE CASCADE;
+  
+  --
+  -- Ketidakleluasaan untuk tabel `post_visits`
+  --
+  ALTER TABLE `post_visits`
+    ADD CONSTRAINT `fk_visits_post` FOREIGN KEY (`post_id`) REFERENCES `posts` (`post_id`) ON DELETE CASCADE;
+  
+  --
+  -- Ketidakleluasaan untuk tabel `promotion_logs`
+  --
+  ALTER TABLE `promotion_logs`
+    ADD CONSTRAINT `fk_promo_affiliate` FOREIGN KEY (`affiliate_id`) REFERENCES `affiliates` (`affiliate_id`) ON DELETE CASCADE;
+  
+  --
+  -- Ketidakleluasaan untuk tabel `reports`
+  --
+  ALTER TABLE `reports`
+    ADD CONSTRAINT `fk_reports_post` FOREIGN KEY (`post_id`) REFERENCES `posts` (`post_id`) ON DELETE CASCADE;
+  COMMIT;
+  
+  /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+  /*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+  /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
+  
+
